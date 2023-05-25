@@ -1,0 +1,604 @@
+---
+title: "Prediction of Response Time - Stack Exchange"
+author: "Srija Vempati, Tejaswini Chintala, Arella Hemalatha, Sravya Basireddy"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## Team members
+Srija Vempati  
+Tejaswini Chintala  
+Arella Hemalatha  
+Sravya Basireddy  
+
+## Problem description
+
+Our goal is to predict the maximum time period it takes for the users to get response for the posted questions. This can help manage their expectations, increase engagement and aid in planning.
+
+In the age of social media, where instantaneous responses are expected, setting an ETA for comments can help alleviate some of the pressure and make the conversation more manageable.
+
+URL link to download the zip file of data collected from the API: https://drive.google.com/file/d/1oo52ys9hsckLgUD3zZGZJDiZII-GkKFI/view?usp=share_link
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Importing required libraries
+
+```{r}
+rm(list = ls())
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(caret)  
+library(dplyr)
+library(wordcloud2)
+library(tidyverse)
+library(h2o)
+library(tidyr)
+library(tidyverse)
+library(kableExtra)
+library(gridExtra)
+library(scales)
+library(lessR)
+library(ggthemes)
+library(plotly)
+require(tidyr)
+require(dplyr)
+```
+## Data Summary
+
+We have extracted data from Stack Exchange API. From this we have merged Questions, Tags and Answers into a single CSV file. This contains 20735 rows and 28 columns.
+
+
+Reading the final_data.csv into stack_data dataframe
+
+```{r}
+stack_data <- read.csv('final_data.csv')
+head(stack_data) %>%
+  kbl(caption = "Post Data Dataset", position = "center") %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  column_spec(1:ncol(stack_data), width = "10%") %>%
+  scroll_box(width="100%")
+
+dim(stack_data)
+
+```
+
+## Data Cleaning
+
+Renaming columns with meaningful names
+
+```{r}
+colnames(stack_data)[colnames(stack_data) %in% c("creation_date.x", "score.x", "score.y", "creation_date.y" )] <- 
+  c("question_creation_date", "question_score", "answer_score", "answer_creation_date")
+colnames(stack_data)[colnames(stack_data) %in% c("ans_owner_user_type", "ans_owner_reputation")] <-
+  c("answer_owner_reputation", "answer_owner_user_type" )
+```
+
+Handling null values and converting string to timestamp
+
+```{r}
+
+
+stack_data <- stack_data %>% mutate(bounty_amount = ifelse(is.na(bounty_amount), 0, bounty_amount))
+stack_data <- stack_data %>% mutate(answer_owner_user_type = ifelse(is.na(answer_owner_user_type) , "unanswered", answer_owner_user_type))
+
+stack_data <- stack_data %>% mutate(is_answered = ifelse(is_answered == TRUE, 1, 0))
+stack_data <- stack_data %>% mutate(is_accepted = ifelse(is_accepted == TRUE, 1, 0))
+
+stack_data <- stack_data %>% mutate(answer_id = coalesce(answer_id, 0),
+                        is_accepted = coalesce(is_accepted, FALSE),
+                        bounty_amount = coalesce(bounty_amount, 0),
+                        answer_score = coalesce(answer_score, 0),
+                        que_owner_reputation = coalesce(que_owner_reputation, 0),
+                        accepted_answer_id = coalesce(accepted_answer_id, 0),
+                        answer_owner_reputation = coalesce(answer_owner_reputation, 0))
+
+# removing rows with no answers
+stack_data = stack_data %>% drop_na(c(answer_creation_date))
+
+# converting string to time stamp
+stack_data$answer_creation_date = strptime(stack_data$answer_creation_date, format = "%Y-%m-%d %H:%M:%S")
+
+# converting seconds to date
+stack_data$question_creation_date = as.POSIXct(stack_data$question_creation_date, origin="1970-01-01 00:00:00")
+```
+
+Adding new columns response_time,day_of_week,time_of_day,weekend_or_not to the dataframe
+
+```{r}
+
+
+# creating new column response_time by taking difference between answer_creation_date and question_creation_date
+stack_data$response_time = ifelse(is.na(stack_data$answer_creation_date), 2000, ceiling(as.numeric(difftime(stack_data$answer_creation_date, stack_data$question_creation_date, units = "days"))))
+
+# adding new column day_of_week, Sunday = 1, Monday = 2, ..., Saturday = 7
+stack_data$day_of_week <- wday(stack_data$question_creation_date)
+part_of_day <- c("Night", "Morning", "Afternoon", "Evening")
+stack_data$time_of_day <- cut(
+  x = as.integer(format(stack_data$question_creation_date, "%H")),
+  breaks = c(-Inf, 6, 12, 18, Inf),
+  labels = part_of_day,
+  include.lowest = TRUE
+)
+
+#time <- hour(hm("00:00", "6:00", "12:00", "18:00", "23:59"))
+#part_of_day <- c("Night", "Morning", "Afternoon", "Evening")
+#stack_data$time_of_day <- cut(x=hour(stack_data$question_creation_date), breaks = time, labels = part_of_day, include.lowest=TRUE)
+
+stack_data %>% mutate(weekend_or_not = ifelse(day_of_week %in% c(1,7), 1, 0)) -> stack_data
+
+# number of characters in question title
+stack_data %>% mutate(len_of_question = (str_count(stack_data$title, ' ') + 1)) -> stack_data
+
+# is first answer accepted? 1 if true
+stack_data %>% mutate(is_first_ans_accepted = ifelse((accepted_answer_id == answer_id && !is.na(accepted_answer_id)
+                                                && !is.na(answer_id)), 1, 0)) -> stack_data
+
+stack_data <- stack_data %>%
+  mutate(is_first_ans_accepted = coalesce(is_first_ans_accepted, 0))
+
+model_df = stack_data[, c("answer_count",'bounty_amount','close_vote_count', 
+                                  'comment_count', 'down_vote_count', 'favorite_count',
+                                  "is_answered",  "question_score", 'up_vote_count', "view_count",
+                                   'answer_score', 'response_time', 'day_of_week', 'time_of_day', 'weekend_or_not',
+                                  'len_of_question', 'is_first_ans_accepted', 'tags',"is_accepted", "que_owner_reputation","que_owner_user_type",
+                                  "answer_owner_user_type", "answer_owner_reputation")]
+
+```
+ 
+Separate the tags column into 5 different columns tags1...tags5 and derive the total number of popular tags for each question
+
+```{r}
+
+model_df = model_df %>% separate(tags, into = c("tags1","tags2","tags3","tags4","tags5"), sep =",")
+
+#get most popular tags
+
+popular_tags_list = list()
+tags_count_table = sort(table(model_df$tags1), decreasing = TRUE)[1:20]
+
+popular_tags_list = append(popular_tags_list, names(tags_count_table))
+
+
+model_df$tags1 <- ifelse(model_df$tags1 %in% popular_tags_list, model_df$tags1, "unpopular_tags")
+model_df$tags2 <- ifelse(model_df$tags2 %in% popular_tags_list, model_df$tags2, "unpopular_tags")
+model_df$tags3 <- ifelse(model_df$tags3 %in% popular_tags_list, model_df$tags3, "unpopular_tags")
+model_df$tags4 <- ifelse(model_df$tags4 %in% popular_tags_list, model_df$tags4, "unpopular_tags")
+model_df$tags5 <- ifelse(model_df$tags5 %in% popular_tags_list, model_df$tags5, "unpopular_tags")
+  
+
+model_df$num_of_popular_tags = 0
+
+model_df = model_df %>% mutate(num_of_popular_tags = ifelse(tags1 != "unpopular_tags", 1, 0)) %>%
+  mutate(num_of_popular_tags = ifelse(tags2 != "unpopular_tags", num_of_popular_tags +1, num_of_popular_tags))%>% 
+  mutate(num_of_popular_tags = ifelse(tags3 != "unpopular_tags", num_of_popular_tags +1, num_of_popular_tags))%>% 
+  mutate(num_of_popular_tags = ifelse(tags4 != "unpopular_tags", num_of_popular_tags +1, num_of_popular_tags))%>% 
+  mutate(num_of_popular_tags = ifelse(tags5 != "unpopular_tags", num_of_popular_tags +1, num_of_popular_tags))
+
+model_df_be = model_df
+
+#write.csv(model_df_be,"final_stack_data.csv", row.names = FALSE)
+```
+
+## Data Exploration
+
+Plot 1: This plot shows how many times a tag from the top 20 tags is used.
+
+```{r echo=FALSE, fig.align='center'}
+viewcount <- aggregate(unlist(model_df_be$view_count), by=list(tg=model_df_be$tags1), FUN=sum)
+Sorted_views <-viewcount[order(-viewcount$x),]
+tag_views <- Sorted_views[2:20,]
+
+ggplot(data = tag_views, mapping = aes(x = reorder(tg, x), x)) + 
+  geom_bar(stat = "identity",fill = c("#7e00e6"))+
+  theme(axis.text.x = element_text(angle=90))+
+  xlab("Tags")+
+  ylab("Count") +
+  ggtitle("Plotting the most popular tags") 
+```
+
+Plot 2: Answered vs Unanswered Questions
+
+```{r}
+ggplot(data = model_df_be , aes(x = model_df_be$is_answered)) +
+  geom_bar(fill="#00e641",  width = 0.7)+
+  xlab("isanswered_or_not") +
+  ggtitle("Checking answered and unanswered")
+
+```
+
+Plot 3: #Weekend vs Weekdays: This graphs show the number of questions answered throughout the week.
+
+```{r}
+ggplot(data = model_df_be, aes(x = model_df_be$weekend_or_not, width=0.7)) +
+  geom_bar(fill="#56B4E9")+
+  xlab("is weekend") 
+```
+
+
+Plot 4: ggtitle("Weekend vs Weekdays") Depicting the count of questions answered on different days of a week
+
+```{r}
+weekdays = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+viewcount <- aggregate(unlist(model_df_be$is_answered), by=list(tg=model_df_be$day_of_week), FUN=sum)
+Sorted_views <-viewcount[order(-viewcount$x),]
+tag_views <- Sorted_views[1:10,]
+tag_views = tag_views %>% drop_na() %>% mutate(day=weekdays[tg])
+ggplot(data = tag_views, 
+                       mapping = aes(x = reorder(day, x),x,fill=day)) + 
+  geom_bar(stat = "identity",width=0.7,show.legend = FALSE)+
+  theme(axis.text.x = element_text(angle=90))+
+  xlab("Day of week")+
+  ylab("Count of questions answered") 
+
+```
+
+
+plot 5 : #PIECHART
+#As the distribution is almost the same over the week. We analyzed during what time of the day majority of the questions were answered.
+
+```{r,results='hide'}
+PieChart(time_of_day, hole = 0, values = "%", data = model_df_be,
+         fill = c("brown","purple","darkgreen","darkblue"), main = "")
+
+```
+Plot 6: The number of words present in the title of each question seems to play a crucial role.
+
+```{r}
+viewcount <- aggregate(unlist(model_df_be$is_answered), by=list(tg=model_df_be$len_of_ques), FUN=sum)
+Sorted_views <-viewcount[order(-viewcount$x),]
+tag_views <- Sorted_views[1:10,]
+ggplot(data = tag_views, mapping = aes(x = reorder(tg, x), x)) + 
+  geom_bar(stat = "identity",fill = c("darkblue"))+
+  theme(axis.text.x = element_text(angle=90))+
+  xlab("Length of the questions")+
+  ylab("No. of questions answered")
+```
+
+
+Encoding variables as ordinal variables
+
+```{r}
+# encoding features
+encoding <- function(x, order = unique(x)) {
+  x <- as.numeric(factor(x, levels = order, exclude = NULL))
+  x
+}
+
+model_df <- model_df %>%
+  mutate(tags1 = ifelse(tags1 == "unpopular_tags", 0, tags1)) %>%
+  mutate(tags2 = ifelse(tags2 == "unpopular_tags", 0, tags2)) %>%
+  mutate(tags3 = ifelse(tags3 == "unpopular_tags", 0, tags3)) %>%
+  mutate(tags4 = ifelse(tags4 == "unpopular_tags", 0, tags4)) %>%
+  mutate(tags5 = ifelse(tags5 == "unpopular_tags", 0, tags5))
+
+for(i in 1: length(popular_tags_list)){
+  model_df[model_df == popular_tags_list[[i]]] = i
+}
+
+model_df$tags1 = as.factor(model_df$tags1)
+model_df$tags2 = as.factor(model_df$tags2)
+model_df$tags3 = as.factor(model_df$tags3)
+model_df$tags4 = as.factor(model_df$tags4)
+model_df$tags5 = as.factor(model_df$tags5)
+
+# encoding variables as ordinal variables using the encoding function
+model_df$time_of_day =  encoding(model_df[["time_of_day"]])
+model_df$que_owner_user_type =  encoding(model_df[["que_owner_user_type"]])
+model_df$answer_owner_user_type =  encoding(model_df[["answer_owner_user_type"]])
+
+#write.csv(model_df_be,"final_data_ae.csv", row.names = FALSE)
+```
+
+
+
+## Loading h2o
+
+```{r,results='hide'}
+library(h2o)
+h2o.init(nthreads = -1) 
+
+data_h2o <- as.h2o(
+  model_df, destination_frame= "train.hex" )
+```
+
+Splitting data to train, valid and test data
+
+```{r}
+splits <- h2o.splitFrame(data = data_h2o,
+                         ratios = c(0.7, 0.15),
+                         seed = 4567)
+
+# splitting data_h2o to training, validation, and test data
+train_h2o <- splits[[1]]
+valid_h2o <- splits[[2]]
+test_h2o  <- splits[[3]]
+
+y <- "response_time" 
+x <- setdiff(names(train_h2o), y)
+
+```
+
+## Random Forest Model
+
+Summary of the random forest regression model, which includes the number of trees, the number of variables used, the mean squared error, the R-squared value, and the variable importance measures
+
+```{r,results='hide'}
+rf_model <- h2o.randomForest(x = x, y = y, 
+                              training_frame = train_h2o,
+                              validation_frame = valid_h2o,
+                              model_id = "rf_model.h2o")
+```
+
+```{r}
+summary(rf_model)
+```
+
+```{r,results='hide'}
+
+# saving and loading the rf_model
+h2o.saveModel(object = rf_model,path = getwd(), force = TRUE)
+rf_model <- h2o.loadModel("rf_model.h2o")
+predictions <- h2o.predict(rf_model, test_h2o)
+```
+
+
+```{r}
+
+# r-squared
+r2<-h2o.r2(rf_model, train = FALSE, valid = FALSE, xval = FALSE)
+r2 %>%
+  kbl(caption = "R2 : Random forest") %>%
+  kable_classic(full_width = F, html_font = "Arial")
+
+# RMSE
+RMSE(predictions, test_h2o$response_time)
+
+```
+
+Variable Importance plot
+
+```{r,results='hide'}
+h2o.varimp_plot(rf_model)
+```
+
+Partial Dependency plot
+
+```{r,results='hide'}
+h2o.partialPlot(rf_model, data = test_h2o, cols = "answer_count")
+```
+
+## Gradient Boost model
+Summary of the GBM regression model, which includes the number of trees, the learning rate, the mean squared error, the R-squared value, and the variable importance measures.
+```{r,results='hide'}
+gb_model <- h2o.gbm(x = x, y = y, 
+                    training_frame = train_h2o,
+                    validation_frame = valid_h2o,
+                    model_id = "gb_model.h2o")
+```
+
+```{r}
+summary(gb_model)
+```
+
+```{r,results='hide'}
+# saving and loading the gb_model
+h2o.saveModel(object = gb_model,path = getwd(), force = TRUE)
+gb_model <- h2o.loadModel("gb_model.h2o")
+
+predictions <- h2o.predict(gb_model, test_h2o)
+
+```
+
+```{r}
+
+# r squared
+
+r2<-h2o.r2(gb_model, train = FALSE, valid = FALSE, xval = FALSE)
+r2 %>%
+  kbl(caption = "R2 : Gradient Boost") %>%
+  kable_classic(full_width = F, html_font = "Arial")
+
+# RMSE
+RMSE(predictions, test_h2o$response_time)
+```
+
+Variable Importance plot
+
+```{r,results='hide'}
+h2o.varimp_plot(gb_model)
+```
+
+Partial Dependency plot
+
+```{r,results='hide'}
+h2o.partialPlot(gb_model, data = test_h2o, cols = "answer_count")
+```
+
+## Deep Learning model
+
+```{r,results='hide'}
+dl_model <- h2o.deeplearning(x = x, 
+                             y = y, 
+                             training_frame = train_h2o, 
+                             model_id = "dl_model.h2o",
+                             epochs = 100,
+                             hidden = c(20,20),
+                             seed = 1,
+                             nfolds = 5,
+                             variable_importances=T)
+```
+
+```{r}
+h2o.scoreHistory(dl_model)
+
+plot(dl_model, 
+     timestep = "epochs", 
+     metric = "rmse")
+```
+
+```{r,results='hide'}
+# saving and loading the dl_model
+h2o.saveModel(object = dl_model,path = getwd(), force = TRUE)
+dl_model <- h2o.loadModel("dl_model.h2o")
+```
+
+```{r}
+# Predict on test data
+summary(dl_model)
+```
+
+```{r,results='hide'}
+
+predictions <- h2o.predict(dl_model, test_h2o)
+```
+
+```{r}
+# r squared
+
+r2<-h2o.r2(dl_model, train = FALSE, valid = FALSE, xval = FALSE)
+r2 %>%
+  kbl(caption = "R2 : Deep Learning") %>%
+  kable_classic(full_width = F, html_font = "Arial")
+
+# RMSE
+RMSE(predictions, test_h2o$response_time)
+```
+
+Variable Importance plot
+
+```{r,results='hide'}
+h2o.varimp_plot(dl_model)
+```
+
+Partial Dependency plot
+
+```{r,results='hide'}
+h2o.partialPlot(dl_model, data = test_h2o, cols = "view_count")
+```
+## Summary of ML models used: 
+The above 3 models random forest, gradient boost and deep learning are used to model the data to predict the target variable. The evaluation metrics for these 3 models gave us an average r2 and rmse values. To improve these metrics we proceeded to use Hyperparameter tuning on the deep Learning model.
+
+Hyperparameter Tuning
+
+```{r,results='hide'}
+hyper_params <- list(
+  activation = c("Rectifier","Tanh","Maxout","RectifierWithDropout","TanhWithDropout","MaxoutWithDropout"),
+  hidden = list( c(32,32,32), c(64,64)),
+  input_dropout_ratio = c(0,0.05),
+  rate = c(0.01,0.02),
+  l1 = seq(from= 0, to=1e-4, by=1e-6),
+  l2 = seq(from=0, to=1e-4, by=1e-6)
+)
+
+search_criteria = list(
+  strategy = "RandomDiscrete",
+  seed= 1234567,
+  stopping_metric =  "deviance",
+  stopping_rounds= 5,
+  # stop when the last 5 models
+  stopping_tolerance= 0.01,
+  # improve less than 1%
+  max_runtime_secs = 360,
+  # stop when the search took more than 360 seconds
+  max_models = 100
+  # stop when the search tried over 100 models
+)
+
+
+grid <- h2o.grid(algorithm="deeplearning",grid_id="dl_grid",
+  x = x,
+  y = y,
+  training_frame = train_h2o,
+  validation_frame = valid_h2o,
+  epochs =10,
+  stopping_metric = "deviance",
+  score_duty_cycle = 0.025,
+  ## don't score more than 2.5% of the wall time
+  adaptive_rate = T,
+  #manually tuned learning rate
+  momentum_start = 0.5,
+  #manually tuned momentum
+  momentum_stable = 0.9,
+  momentum_ramp = 1e7,
+  activation = c("Rectifier"),
+  max_w2 =10,
+  #can help improve stability for Rectifier
+  hyper_params = hyper_params,
+  search_criteria = search_criteria
+)
+
+summary(grid, show_stack_traces = TRUE)
+
+```
+
+
+
+```{r,results='hide'}
+grid <- h2o.getGrid("dl_grid", sort_by="rmse", decreasing=FALSE)
+dl_grid_summary_table <- grid@summary_table
+
+dl_grid_best_model <- h2o.getModel(dl_grid_summary_table$model_ids[1])
+
+summary(dl_grid_best_model)
+
+dl_grid_best_model_params <- dl_grid_best_model@allparameters
+dl_grid_best_model_params
+
+h2o.saveModel(object = dl_grid_best_model,path = getwd())
+dl_grid_best_model <- h2o.loadModel("dl_grid_model_104")
+
+```
+
+R square and RMSE values
+
+```{r}
+
+r2<-h2o.r2(dl_grid_best_model, train = FALSE, valid = FALSE, xval = FALSE)
+r2 %>%
+  kbl(caption = "R2 : Deep Learning") %>%
+  kable_classic(full_width = F, html_font = "Arial")
+
+
+RMSE(predictions, test_h2o$response_time)
+```
+
+```{r,results='hide'}
+h2o.varimp_plot(dl_grid_best_model)
+```
+
+```{r,results='hide'}
+h2o.partialPlot(dl_grid_best_model, data = test_h2o, cols = "up_vote_count")
+
+```
+
+## Results Summary: 
+
+Hyperparameter tuning helped us to identify the best set of hyperparameters for a given model and dataset, which lead to a more accurate model with a higher R-squared value. Therefore, higher R-squared value is visible after hypertuning than before, indicating that the model is now better at explaining the variance in the dependent variable.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
